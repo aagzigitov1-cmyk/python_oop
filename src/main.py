@@ -1154,6 +1154,10 @@ def run_demo_day6():
 
     print("\n=== Демо Day 6 завершено ===")
 
+   
+
+   
+ 
 
 
 if __name__ == "__main__":
