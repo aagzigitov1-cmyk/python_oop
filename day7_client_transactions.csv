@@ -1,0 +1,2 @@
+tx_id,type,amount,currency,fee,sender,receiver,status,reason,created_at,updated_at,attempts
+e46cdab7-4,transfer,100,RUB,0.0,d201ff17,5f8fa522,completed,,2026-06-09T05:17:14.199865,2026-06-09T05:17:14.200039,0

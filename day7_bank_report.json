@@ -1,0 +1,39 @@
+{
+  "bank": {
+    "name": "Day7 Bank"
+  },
+  "accounts": [
+    {
+      "account_id": "d201ff17",
+      "owner": "Ирина Петрова",
+      "balance": 400.0,
+      "currency": "RUB",
+      "status": "active"
+    },
+    {
+      "account_id": "5f8fa522",
+      "owner": "Ирина Петрова",
+      "balance": 250,
+      "currency": "RUB",
+      "status": "active",
+      "min_balance": 20,
+      "monthly_rate": 0.01
+    }
+  ],
+  "transactions": [
+    {
+      "tx_id": "e46cdab7-4",
+      "type": "transfer",
+      "amount": 100,
+      "currency": "RUB",
+      "fee": 0.0,
+      "sender": "d201ff17",
+      "receiver": "5f8fa522",
+      "status": "completed",
+      "reason": null,
+      "created_at": "2026-06-09T05:17:14.199865",
+      "updated_at": "2026-06-09T05:17:14.200039",
+      "attempts": 0
+    }
+  ]
+}

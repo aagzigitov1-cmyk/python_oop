@@ -1,0 +1,41 @@
+{
+  "bank": {
+    "name": "Day7 Bank"
+  },
+  "audit_entries": [
+    {
+      "time": "2026-06-09T05:17:14.199909",
+      "level": "INFO",
+      "message": "Risk low for tx e46cdab7-4",
+      "context": {
+        "reasons": [
+          "new_receiver_account"
+        ],
+        "tx": {
+          "tx_id": "e46cdab7-4",
+          "type": "transfer",
+          "amount": 100,
+          "currency": "RUB",
+          "fee": null,
+          "sender": "d201ff17",
+          "receiver": "5f8fa522",
+          "status": "processing",
+          "reason": null,
+          "created_at": "2026-06-09T05:17:14.199865",
+          "updated_at": "2026-06-09T05:17:14.199877",
+          "attempts": 0
+        }
+      }
+    }
+  ],
+  "suspicious_actions": [],
+  "risk_summary": {
+    "levels": {
+      "INFO": 1
+    },
+    "reasons": {
+      "new_receiver_account": 1
+    },
+    "suspicious_count": 0
+  }
+}
