@@ -85,6 +85,135 @@ class ReportBuilder:
             for row in transactions:
                 writer.writerow(row)
 
+    def export_to_text(self, report: dict, path: str, report_type: str = "client"):
+        """Export report to human-readable text format."""
+        lines = []
+        lines.append("=" * 80)
+        lines.append("БАНКОВСКИЙ ОТЧЁТ".center(80))
+        lines.append("=" * 80)
+        lines.append("")
+        
+        if report_type == "client":
+            # Client report
+            client = report.get("client", {})
+            lines.append(f"Клиент: {client.get('full_name', 'N/A')}")
+            lines.append(f"ID: {client.get('client_id', 'N/A')}")
+            lines.append(f"Статус: {client.get('status', 'N/A')}")
+            lines.append("")
+            
+            # Accounts section
+            accounts = report.get("accounts", [])
+            lines.append("СЧЁТА".center(80))
+            lines.append("-" * 80)
+            for acc in accounts:
+                lines.append(f"  Счёт: {acc.get('account_id', 'N/A')}")
+                lines.append(f"    Тип: {acc.get('account_type', 'N/A')}")
+                lines.append(f"    Баланс: {acc.get('balance', 0):.2f} {acc.get('currency', 'N/A')}")
+                lines.append(f"    Статус: {acc.get('status', 'N/A')}")
+                lines.append("")
+            
+            # Transactions section
+            txs = report.get("transactions", [])
+            lines.append("ТРАНЗАКЦИИ".center(80))
+            lines.append("-" * 80)
+            total_in = 0
+            total_out = 0
+            completed_count = 0
+            failed_count = 0
+            
+            for tx in txs:
+                lines.append(f"  ID: {tx.get('tx_id', 'N/A')}")
+                lines.append(f"    Тип: {tx.get('operation', 'N/A')}")
+                lines.append(f"    От счёта: {tx.get('sender_id', 'N/A')}")
+                lines.append(f"    На счёт: {tx.get('receiver_id', 'N/A')}")
+                lines.append(f"    Сумма: {tx.get('amount', 0):.2f} {tx.get('currency', 'N/A')}")
+                lines.append(f"    Комиссия: {tx.get('fee', 0):.2f}")
+                lines.append(f"    Статус: {tx.get('status', 'N/A')}")
+                lines.append(f"    Дата: {tx.get('updated_at', 'N/A')}")
+                lines.append("")
+                
+                status = tx.get('status', '')
+                if status == 'COMPLETED':
+                    completed_count += 1
+                    total_in += tx.get('amount', 0)
+                elif status == 'FAILED':
+                    failed_count += 1
+                    total_out += tx.get('amount', 0)
+            
+            # Summary
+            lines.append("ИТОГОВАЯ СТАТИСТИКА".center(80))
+            lines.append("-" * 80)
+            lines.append(f"  Всего транзакций: {len(txs)}")
+            lines.append(f"  Успешно: {completed_count}")
+            lines.append(f"  Ошибок: {failed_count}")
+            lines.append(f"  Входящие средства: {total_in:.2f}")
+            lines.append(f"  Исходящие средства: {total_out:.2f}")
+            
+        elif report_type == "bank":
+            # Bank-wide report
+            bank_info = report.get("bank", {})
+            lines.append(f"Банк: {bank_info.get('name', 'N/A')}")
+            lines.append("")
+            
+            # Accounts summary
+            accounts = report.get("accounts", [])
+            lines.append("СЧЕТА БАНКА".center(80))
+            lines.append("-" * 80)
+            lines.append(f"{'Счёт':<20} {'Клиент':<20} {'Баланс':<15} {'Статус':<10}")
+            lines.append("-" * 80)
+            total_balance = 0
+            for acc in accounts:
+                lines.append(f"{acc.get('account_id', ''):<20} {acc.get('owner', ''):<20} {acc.get('balance', 0):<15.2f} {acc.get('status', ''):<10}")
+                total_balance += acc.get('balance', 0)
+            lines.append("-" * 80)
+            lines.append(f"{'ОБЩИЙ БАЛАНС:':<20} {'':<20} {total_balance:<15.2f}")
+            lines.append("")
+            
+            # Transactions summary
+            txs = report.get("transactions", [])
+            lines.append("СТАТИСТИКА ТРАНЗАКЦИЙ".center(80))
+            lines.append("-" * 80)
+            completed = len([t for t in txs if t.get('status') == 'COMPLETED'])
+            failed = len([t for t in txs if t.get('status') == 'FAILED'])
+            pending = len([t for t in txs if t.get('status') == 'PENDING'])
+            lines.append(f"  Всего: {len(txs)}")
+            lines.append(f"  Успешно: {completed}")
+            lines.append(f"  Ошибок: {failed}")
+            lines.append(f"  В ожидании: {pending}")
+        
+        elif report_type == "risk":
+            # Risk report
+            lines.append("ОТЧЁТ О РИСКАХ".center(80))
+            lines.append("-" * 80)
+            
+            bank_info = report.get("bank", {})
+            lines.append(f"Банк: {bank_info.get('name', 'N/A')}")
+            lines.append("")
+            
+            risk_summary = report.get("risk_summary", {})
+            lines.append("УРОВНИ РИСКА".center(80))
+            levels = risk_summary.get("levels", {})
+            for level, count in levels.items():
+                lines.append(f"  {level}: {count}")
+            
+            lines.append("")
+            lines.append("ПРИЧИНЫ РИСКА".center(80))
+            reasons = risk_summary.get("reasons", {})
+            for reason, count in reasons.items():
+                lines.append(f"  {reason}: {count}")
+            
+            lines.append("")
+            lines.append(f"Подозрительных действий: {risk_summary.get('suspicious_count', 0)}")
+        
+        lines.append("")
+        lines.append("=" * 80)
+        lines.append(f"Сгенерировано: {datetime.now().isoformat()}")
+        lines.append("=" * 80)
+        
+        # Write to file
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
     def save_charts(self, client_id: str, path_prefix: str):
         """Generate and save all charts: balance movement, transaction type pie, and status bar."""
         if plt is None:

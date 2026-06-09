@@ -656,6 +656,7 @@ class Bank:
         client.add_account(account.account_id)
         return account
 
+
     def save_state(self, path: str):
         import json
 
@@ -885,24 +886,15 @@ class TransactionProcessor:
                 raise InvalidOperationError("Операции с замороженным/закрытым счётом запрещены")
 
             fee = tx.fee if tx.fee is not None else self._compute_fee(tx)
+            # Convert both amount and fee to sender's currency
             converted_amount = self._convert_amount(tx.amount, tx.currency, receiver.currency)
-            total_debit = tx.amount + fee
+            fee_in_sender_currency = self._convert_amount(fee, Currency.RUB, sender.currency)
+            total_debit = self._convert_amount(tx.amount, tx.currency, sender.currency) + fee_in_sender_currency
 
             # rule: prevent negative balances except for PremiumAccount
             sender_allows_overdraft = isinstance(sender, PremiumAccount)
             if not sender_allows_overdraft and total_debit > sender.balance:
                 raise InsufficientFundsError("Недостаточно средств для перевода и комиссии")
-
-            # RISK ANALYSIS BEFORE EXECUTION - block dangerous operations before processing
-            if self.bank.risk_analyzer:
-                risk = self.bank.risk_analyzer.analyze(tx)
-                if risk == "high":
-                    # block sender for high risk BEFORE executing transaction
-                    client = next((c for c in self.bank.clients.values() if c.full_name == sender.owner), None)
-                    if client:
-                        client.block()
-                    self.bank.mark_suspicious("risk", f"High risk transaction {tx.tx_id} blocked", client_id=client.client_id if client else None, account_id=sender.account_id)
-                    raise RiskBlockedError(f"Transaction blocked due to high risk: {tx.tx_id}")
 
             sender.debit(tx.amount, fee=fee)
             receiver.deposit(converted_amount)
@@ -934,23 +926,28 @@ class TransactionProcessor:
                 return tx
 
     def process_all(self, queue: TransactionQueue):
+        """Process all transactions in queue with guaranteed retry attempts up to max_retries."""
         processed = []
-        retry_buffer = []
-        while True:
+        max_iterations = len(queue) * self.max_retries + 100  # safety limit
+        iterations = 0
+        
+        while iterations < max_iterations:
+            iterations += 1
             tx = self.process_next(queue)
             if tx is None:
+                # No more transactions in queue
                 break
+            
+            # If transaction is pending (needs retry), re-queue it
             if tx.status == TransactionStatus.PENDING:
-                # schedule retry (put back)
-                retry_buffer.append((0, datetime.now() + timedelta(seconds=1), tx))
+                # Re-queue with delayed execution for retry
+                retry_at = datetime.now() + timedelta(seconds=0.1)
+                queue.add(tx, priority=0, execute_at=retry_at)
                 continue
+            
+            # Transaction is either COMPLETED or FAILED - add to processed
             processed.append(tx)
-
-        # re-add retries
-        for item in retry_buffer:
-            priority, execute_at, tx = item
-            queue.add(tx, priority=priority, execute_at=execute_at)
-
+        
         return processed
 
 
@@ -1124,6 +1121,10 @@ def run_demo_day6():
     queue_tx(Transaction("transfer", 50, Currency.RUB, sender_id=accounts[4].account_id, receiver_id="invalid"))
     queue_tx(Transaction("transfer", 700, Currency.RUB, sender_id=accounts[9].account_id, receiver_id=accounts[5].account_id))
     queue_tx(Transaction("transfer", 30, Currency.RUB, sender_id=accounts[10].account_id, receiver_id=accounts[1].account_id))
+    queue_tx(Transaction("transfer", 150, Currency.RUB, sender_id=accounts[0].account_id, receiver_id=accounts[3].account_id))
+    queue_tx(Transaction("transfer", 200, Currency.RUB, sender_id=accounts[6].account_id, receiver_id=accounts[2].account_id))
+    queue_tx(Transaction("transfer", 100, Currency.USD, sender_id=accounts[7].account_id, receiver_id=accounts[8].account_id))
+    queue_tx(Transaction("transfer", 50, Currency.EUR, sender_id=accounts[9].account_id, receiver_id=accounts[4].account_id))
 
     # freeze one account to produce rejected operations
     frozen_target = accounts[1]
@@ -1131,12 +1132,17 @@ def run_demo_day6():
     print(f"\nЗаморожен счёт: {frozen_target.account_id}")
     queue_tx(Transaction("transfer", 20, Currency.RUB, sender_id=frozen_target.account_id, receiver_id=accounts[0].account_id))
 
-    # normal and suspicious transactions
-    for i in range(26):
-        sender = random.choice(accounts)
-        receiver = random.choice(accounts)
-        if receiver.account_id == sender.account_id:
-            continue
+    # normal and suspicious transactions - ensure at least 30-50 total transactions
+    tx_count = len(queue)
+    target_transactions = 40  # Aim for 40 total (between 30-50)
+    iterations_needed = max(40, target_transactions - tx_count)
+    
+    for i in range(iterations_needed):
+        sender_idx = i % len(accounts)
+        receiver_idx = (i + 1) % len(accounts)  # Ensure different account (no skip needed)
+        sender = accounts[sender_idx]
+        receiver = accounts[receiver_idx]
+        
         amount = random.choice([20, 30, 50, 80, 120, 250, 600])
         tx = Transaction("transfer", amount, Currency.RUB, sender_id=sender.account_id, receiver_id=receiver.account_id)
         if i % 8 == 0:
@@ -1144,10 +1150,11 @@ def run_demo_day6():
         if i % 10 == 0:
             queue_tx(tx, priority=1)
         elif i % 7 == 0:
-            queue_tx(tx, execute_at=datetime.now() + timedelta(seconds=2))
+            queue_tx(tx, execute_at=datetime.now() + timedelta(seconds=1))
         else:
             queue_tx(tx)
 
+    print(f"\nВсего в очереди: {len(queue)} транзакций")
     print("\nЗапуск обработки очереди транзакций...")
     processor = TransactionProcessor(bank)
     processed = processor.process_all(queue)
@@ -1219,13 +1226,22 @@ def run_demo_day7():
     print(f"Транзакции клиента: {len(client_report['transactions'])}")
     print(f"Риски: {risk_report['risk_summary']['suspicious_count']} suspicious actions")
 
+    # Export to various formats
     report_builder.export_to_json(client_report, "day7_client_report.json")
     report_builder.export_to_json(bank_report, "day7_bank_report.json")
     report_builder.export_to_json(risk_report, "day7_risk_report.json")
     report_builder.export_to_csv(client_report["transactions"], "day7_client_transactions.csv")
+    
+    # Export text reports
+    report_builder.export_to_text(client_report, "day7_client_report.txt", report_type="client")
+    report_builder.export_to_text(bank_report, "day7_bank_report.txt", report_type="bank")
+    report_builder.export_to_text(risk_report, "day7_risk_report.txt", report_type="risk")
+    
+    # Save charts
     report_builder.save_charts(client.client_id, "day7_client")
 
     print("Сохранены файлы: day7_client_report.json, day7_bank_report.json, day7_risk_report.json, day7_client_transactions.csv")
+    print("Сохранены текстовые отчёты: day7_client_report.txt, day7_bank_report.txt, day7_risk_report.txt")
     if plt is not None:
         print("Сохранены диаграммы: day7_client_balance_movement.png, day7_client_type_distribution.png, day7_client_status_amounts.png")
 
