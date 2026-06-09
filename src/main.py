@@ -8,6 +8,7 @@ import csv
 import logging
 import random
 import uuid
+from src.reporting import ReportBuilder
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,7 +89,7 @@ class BankAccount(AbstractAccount):
         )
         
         self.currency = currency
-        
+        self.creation_date = datetime.now()  # Track account creation date for risk analysis
 
     def _check_status(self):
         if self.status == AccountStatus.FROZEN:
@@ -175,6 +176,8 @@ class InsufficientFundsError(AccountError):
     pass
 
 
+class RiskBlockedError(AccountError):
+    pass
 
 
 
@@ -433,6 +436,21 @@ class InvestmentAccount(BankAccount):
             "projected_growth": self.project_yearly_growth(),
         })
         return info
+
+    def withdraw(self, amount: float):
+        """Withdraw from investment account with asset liquidation notification."""
+        self._check_status()
+        self._validate_amount(amount)
+
+        if amount > self._balance:
+            raise InsufficientFundsError("Недостаточно средств для снятия")
+
+        # For investment accounts, withdrawal may trigger partial asset liquidation
+        total_assets = sum(self.virtual_assets.values())
+        if total_assets > 0:
+            logger.info(f"Investment account {self.account_id}: withdrawing {amount}, liquidating assets (total: {total_assets})")
+
+        self._balance -= amount
 
     def __str__(self):
         assets = ", ".join(
@@ -835,7 +853,7 @@ class TransactionProcessor:
 
     def _convert_amount(self, amount: float, from_currency: Currency, to_currency: Currency) -> float:
         # simplistic conversion rates for demo (RUB base)
-        rates = {"RUB": 1.0, "USD": 70.0, "EUR": 80.0}
+        rates = {"RUB": 1.0, "USD": 70.0, "EUR": 80.0, "KZT": 0.15, "CNY": 10.0}
         if from_currency == to_currency:
             return amount
         base = amount * rates[from_currency.value]
@@ -867,15 +885,30 @@ class TransactionProcessor:
                 raise InvalidOperationError("Операции с замороженным/закрытым счётом запрещены")
 
             fee = tx.fee if tx.fee is not None else self._compute_fee(tx)
+            # Convert both amount and fee to sender's currency
             converted_amount = self._convert_amount(tx.amount, tx.currency, receiver.currency)
-            total_debit = tx.amount + fee
+            fee_in_sender_currency = self._convert_amount(fee, Currency.RUB, sender.currency)
+            total_debit = self._convert_amount(tx.amount, tx.currency, sender.currency) + fee_in_sender_currency
 
             # rule: prevent negative balances except for PremiumAccount
             sender_allows_overdraft = isinstance(sender, PremiumAccount)
             if not sender_allows_overdraft and total_debit > sender.balance:
                 raise InsufficientFundsError("Недостаточно средств для перевода и комиссии")
 
-            sender.debit(tx.amount, fee=fee)
+            # RISK ANALYSIS BEFORE EXECUTION - block dangerous operations before processing
+            if self.bank.risk_analyzer:
+                risk = self.bank.risk_analyzer.analyze(tx)
+                if risk == "high":
+                    # block sender for high risk BEFORE executing transaction
+                    client = next((c for c in self.bank.clients.values() if c.full_name == sender.owner), None)
+                    if client:
+                        client.block()
+                    self.bank.mark_suspicious("risk", f"High risk transaction {tx.tx_id} blocked", client_id=client.client_id if client else None, account_id=sender.account_id)
+                    raise RiskBlockedError(f"Transaction blocked due to high risk: {tx.tx_id}")
+
+            # Debit sender in their own currency (amount converted + fee in sender's currency)
+            amount_in_sender_currency = self._convert_amount(tx.amount, tx.currency, sender.currency)
+            sender.debit(amount_in_sender_currency, fee=fee_in_sender_currency)
             receiver.deposit(converted_amount)
 
             tx.fee = fee
@@ -883,15 +916,6 @@ class TransactionProcessor:
             tx.updated_at = datetime.now()
             # record transaction
             self.bank.transactions.append(tx)
-            # risk analysis
-            if self.bank.risk_analyzer:
-                risk = self.bank.risk_analyzer.analyze(tx)
-                if risk == "high":
-                    # block sender for high risk
-                    client = next((c for c in self.bank.clients.values() if c.full_name == sender.owner), None)
-                    if client:
-                        client.block()
-                        self.bank.mark_suspicious("risk", f"High risk transaction {tx.tx_id}", client_id=client.client_id, account_id=sender.account_id)
             return tx
 
         except Exception as e:
@@ -902,33 +926,40 @@ class TransactionProcessor:
             if tx.attempts >= self.max_retries:
                 tx.status = TransactionStatus.FAILED
                 self.bank.mark_suspicious("transaction", tx.reason, client_id=sender.owner if sender else None, account_id=tx.sender_id)
+                # Add failed transaction to history so it's not lost
+                self.bank.transactions.append(tx)
+                logger.warning("Transaction %s failed after %d attempts, marked as FAILED", tx.tx_id, tx.attempts)
+                return tx
             else:
                 tx.status = TransactionStatus.PENDING
                 # requeue for retry shortly
                 retry_at = datetime.now() + timedelta(seconds=1)
-                self.bank  # no-op to keep reference
-                return_tx = tx
-                # place back into the bank's queue is caller responsibility; return tx to signal retry
-                return return_tx
+                logger.info("Transaction %s will be retried at %s", tx.tx_id, retry_at)
+                return tx
 
     def process_all(self, queue: TransactionQueue):
+        """Process all transactions in queue with guaranteed retry attempts up to max_retries."""
         processed = []
-        retry_buffer = []
-        while True:
+        max_iterations = len(queue) * self.max_retries + 100  # safety limit
+        iterations = 0
+        
+        while iterations < max_iterations:
+            iterations += 1
             tx = self.process_next(queue)
             if tx is None:
+                # No more transactions in queue
                 break
+            
+            # If transaction is pending (needs retry), re-queue it
             if tx.status == TransactionStatus.PENDING:
-                # schedule retry (put back)
-                retry_buffer.append((0, datetime.now() + timedelta(seconds=1), tx))
+                # Re-queue with delayed execution for retry
+                retry_at = datetime.now() + timedelta(seconds=0.1)
+                queue.add(tx, priority=0, execute_at=retry_at)
                 continue
+            
+            # Transaction is either COMPLETED or FAILED - add to processed
             processed.append(tx)
-
-        # re-add retries
-        for item in retry_buffer:
-            priority, execute_at, tx = item
-            queue.add(tx, priority=priority, execute_at=execute_at)
-
+        
         return processed
 
 
@@ -994,8 +1025,12 @@ class RiskAnalyzer:
         # transfers to new accounts
         receiver_acc = self.bank.accounts.get(tx.receiver_id)
         if receiver_acc:
-            # check if receiver account recently created (no precise creation date, skip if unknown)
-            pass
+            # check if receiver account recently created
+            if hasattr(receiver_acc, 'creation_date'):
+                account_age = datetime.now() - receiver_acc.creation_date
+                if account_age.days < self.new_account_days:
+                    score += 1
+                    reasons.append("new_receiver_account")
 
         # nighttime
         if tx.created_at.hour < 5:
@@ -1098,6 +1133,10 @@ def run_demo_day6():
     queue_tx(Transaction("transfer", 50, Currency.RUB, sender_id=accounts[4].account_id, receiver_id="invalid"))
     queue_tx(Transaction("transfer", 700, Currency.RUB, sender_id=accounts[9].account_id, receiver_id=accounts[5].account_id))
     queue_tx(Transaction("transfer", 30, Currency.RUB, sender_id=accounts[10].account_id, receiver_id=accounts[1].account_id))
+    queue_tx(Transaction("transfer", 150, Currency.RUB, sender_id=accounts[0].account_id, receiver_id=accounts[3].account_id))
+    queue_tx(Transaction("transfer", 200, Currency.RUB, sender_id=accounts[6].account_id, receiver_id=accounts[2].account_id))
+    queue_tx(Transaction("transfer", 100, Currency.USD, sender_id=accounts[7].account_id, receiver_id=accounts[8].account_id))
+    queue_tx(Transaction("transfer", 50, Currency.EUR, sender_id=accounts[9].account_id, receiver_id=accounts[4].account_id))
 
     # freeze one account to produce rejected operations
     frozen_target = accounts[1]
@@ -1105,12 +1144,17 @@ def run_demo_day6():
     print(f"\nЗаморожен счёт: {frozen_target.account_id}")
     queue_tx(Transaction("transfer", 20, Currency.RUB, sender_id=frozen_target.account_id, receiver_id=accounts[0].account_id))
 
-    # normal and suspicious transactions
-    for i in range(26):
-        sender = random.choice(accounts)
-        receiver = random.choice(accounts)
-        if receiver.account_id == sender.account_id:
-            continue
+    # normal and suspicious transactions - ensure at least 30-50 total transactions
+    tx_count = len(queue)
+    target_transactions = 40  # Aim for 40 total (between 30-50)
+    iterations_needed = max(40, target_transactions - tx_count)
+    
+    for i in range(iterations_needed):
+        sender_idx = i % len(accounts)
+        receiver_idx = (i + 1) % len(accounts)  # Ensure different account (no skip needed)
+        sender = accounts[sender_idx]
+        receiver = accounts[receiver_idx]
+        
         amount = random.choice([20, 30, 50, 80, 120, 250, 600])
         tx = Transaction("transfer", amount, Currency.RUB, sender_id=sender.account_id, receiver_id=receiver.account_id)
         if i % 8 == 0:
@@ -1118,10 +1162,11 @@ def run_demo_day6():
         if i % 10 == 0:
             queue_tx(tx, priority=1)
         elif i % 7 == 0:
-            queue_tx(tx, execute_at=datetime.now() + timedelta(seconds=2))
+            queue_tx(tx, execute_at=datetime.now() + timedelta(seconds=1))
         else:
             queue_tx(tx)
 
+    print(f"\nВсего в очереди: {len(queue)} транзакций")
     print("\nЗапуск обработки очереди транзакций...")
     processor = TransactionProcessor(bank)
     processed = processor.process_all(queue)
@@ -1154,6 +1199,10 @@ def run_demo_day6():
 
     print("\n=== Демо Day 6 завершено ===")
 
+   
+
+   
+ 
 
 
 if __name__ == "__main__":
@@ -1162,138 +1211,6 @@ if __name__ == "__main__":
 
 
 # День 7 - Система отчётности и визуализации
-
-class ReportBuilder:
-    def __init__(self, bank):
-        self.bank = bank
-
-    def report_client(self, client_id: str) -> dict:
-        client = self.bank.clients.get(client_id)
-        if not client:
-            raise ValueError("Client not found")
-
-        accounts = [
-            self.bank.accounts[aid].get_account_info()
-            for aid in client.account_ids
-            if aid in self.bank.accounts
-        ]
-        transactions = [
-            t.to_dict()
-            for t in self.bank.transactions
-            if t.sender_id in client.account_ids or t.receiver_id in client.account_ids
-        ]
-
-        return {
-            "client": client.get_info(),
-            "accounts": accounts,
-            "transactions": transactions,
-        }
-
-    def report_bank(self) -> dict:
-        accounts = [a.get_account_info() for a in self.bank.accounts.values()]
-        transactions = [t.to_dict() for t in self.bank.transactions]
-        return {"bank": {"name": self.bank.name}, "accounts": accounts, "transactions": transactions}
-
-    def report_risk(self) -> dict:
-        audit_entries = self.bank.audit_log.entries if self.bank.audit_log else []
-        suspicious_actions = list(self.bank.suspicious_actions)
-
-        level_counts: dict[str, int] = {}
-        reason_counts: dict[str, int] = {}
-        for entry in audit_entries:
-            level = entry.get("level", "UNKNOWN")
-            level_counts[level] = level_counts.get(level, 0) + 1
-            context = entry.get("context", {}) or {}
-            reasons = context.get("reasons")
-            if isinstance(reasons, list):
-                for reason in reasons:
-                    reason_counts[reason] = reason_counts.get(reason, 0) + 1
-            elif reasons:
-                reason_counts[str(reasons)] = reason_counts.get(str(reasons), 0) + 1
-
-        return {
-            "bank": {"name": self.bank.name},
-            "audit_entries": audit_entries,
-            "suspicious_actions": suspicious_actions,
-            "risk_summary": {
-                "levels": level_counts,
-                "reasons": reason_counts,
-                "suspicious_count": len(suspicious_actions),
-            },
-        }
-
-    def export_to_json(self, data: dict, path: str):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-    def export_to_csv(self, transactions: list[dict], path: str):
-        if not transactions:
-            return
-        keys = transactions[0].keys()
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=keys)
-            writer.writeheader()
-            for row in transactions:
-                writer.writerow(row)
-
-    def save_charts(self, client_id: str, path_prefix: str):
-        if plt is None:
-            return
-        report = self.report_client(client_id)
-        txs = report["transactions"]
-        if not txs:
-            return
-
-        self._save_balance_chart(report, txs, path_prefix)
-        self._save_transaction_type_pie(report, txs, path_prefix)
-        self._save_status_bar_chart(report, txs, path_prefix)
-
-    def _save_balance_chart(self, report: dict, txs: list[dict], path_prefix: str):
-        times = [datetime.fromisoformat(t["updated_at"]) for t in txs]
-        amounts = [t["amount"] for t in txs]
-        plt.figure()
-        plt.plot(times, amounts, marker='o')
-        plt.title(f"Balance movement for {report['client']['full_name']}")
-        plt.xlabel("Time")
-        plt.ylabel("Amount")
-        plt.grid(True, linestyle='--', alpha=0.4)
-        plt.tight_layout()
-        plt.savefig(f"{path_prefix}_balance_movement.png")
-        plt.close()
-
-    def _save_transaction_type_pie(self, report: dict, txs: list[dict], path_prefix: str):
-        type_counts: dict[str, int] = {}
-        for t in txs:
-            tx_type = t.get("type") or "unknown"
-            type_counts[tx_type] = type_counts.get(tx_type, 0) + 1
-        labels = list(type_counts.keys())
-        sizes = list(type_counts.values())
-        if not labels:
-            return
-        plt.figure()
-        plt.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=140)
-        plt.title(f"Transaction type distribution for {report['client']['full_name']}")
-        plt.tight_layout()
-        plt.savefig(f"{path_prefix}_type_distribution.png")
-        plt.close()
-
-    def _save_status_bar_chart(self, report: dict, txs: list[dict], path_prefix: str):
-        status_sums: dict[str, float] = {}
-        for t in txs:
-            status = t.get("status") or "unknown"
-            status_sums[status] = status_sums.get(status, 0.0) + float(t.get("amount", 0.0))
-        labels = list(status_sums.keys())
-        values = [status_sums[label] for label in labels]
-        if not labels:
-            return
-        plt.figure()
-        plt.bar(labels, values, color=["#4c72b0", "#55a868", "#c44e52", "#8172b2"][: len(labels)])
-        plt.title(f"Transaction amount by status for {report['client']['full_name']}")
-        plt.xlabel("Status")
-        plt.ylabel("Total amount")
-        plt.tight_layout()
-        plt.savefig(f"{path_prefix}_status_amounts.png")
-        plt.close()
 
 
 def run_demo_day7():
@@ -1321,13 +1238,22 @@ def run_demo_day7():
     print(f"Транзакции клиента: {len(client_report['transactions'])}")
     print(f"Риски: {risk_report['risk_summary']['suspicious_count']} suspicious actions")
 
+    # Export to various formats
     report_builder.export_to_json(client_report, "day7_client_report.json")
     report_builder.export_to_json(bank_report, "day7_bank_report.json")
     report_builder.export_to_json(risk_report, "day7_risk_report.json")
     report_builder.export_to_csv(client_report["transactions"], "day7_client_transactions.csv")
+    
+    # Export text reports
+    report_builder.export_to_text(client_report, "day7_client_report.txt", report_type="client")
+    report_builder.export_to_text(bank_report, "day7_bank_report.txt", report_type="bank")
+    report_builder.export_to_text(risk_report, "day7_risk_report.txt", report_type="risk")
+    
+    # Save charts
     report_builder.save_charts(client.client_id, "day7_client")
 
     print("Сохранены файлы: day7_client_report.json, day7_bank_report.json, day7_risk_report.json, day7_client_transactions.csv")
+    print("Сохранены текстовые отчёты: day7_client_report.txt, day7_bank_report.txt, day7_risk_report.txt")
     if plt is not None:
         print("Сохранены диаграммы: day7_client_balance_movement.png, day7_client_type_distribution.png, day7_client_status_amounts.png")
 
